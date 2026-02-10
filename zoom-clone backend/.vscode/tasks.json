@@ -1,0 +1,60 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Dev Server (Watch Mode)",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "dev:watch"],
+      "isBackground": true,
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": {
+        "pattern": {
+          "regexp": "^.*$",
+          "file": 1,
+          "location": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^.*",
+          "endsPattern": "^.*listening.*"
+        }
+      }
+    },
+    {
+      "label": "Dev Server (Standard)",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "dev"],
+      "group": "build"
+    },
+    {
+      "label": "Build TypeScript",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "build"],
+      "group": "build",
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "Start Production Server",
+      "type": "shell",
+      "command": "npm",
+      "args": ["start"],
+      "group": "build"
+    },
+    {
+      "label": "Watch TypeScript",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "watch"],
+      "isBackground": true,
+      "group": "build",
+      "problemMatcher": ["$tsc-watch"]
+    }
+  ]
+}
