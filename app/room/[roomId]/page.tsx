@@ -3,14 +3,22 @@
 import { use, useEffect, useRef, useState } from "react";
 import type Peer from "peerjs";
 import type { MediaConnection } from "peerjs";
+import { PEER_CONFIG, ICE_SERVERS } from "@/lib/peerConfig";
+import { checkBrowserSupport, isValidRoomId } from "@/lib/browserCheck";
 
+// ── Types ──────────────────────────────────────────────
 type RoomState =
-  | "requesting" // Getting camera permission
-  | "connecting" // Camera ready, connecting to PeerJS server
-  | "waiting" // On PeerJS server, waiting for other user
-  | "connected" // In call with peer
+  | "requesting"
+  | "connecting"
+  | "waiting"
+  | "connected"
+  | "reconnecting"
   | "error";
 
+const MAX_RECONNECT = 3;
+const RECONNECT_DELAY = 2000;
+
+// ── Component ──────────────────────────────────────────
 export default function RoomPage({
   params,
 }: {
@@ -18,20 +26,24 @@ export default function RoomPage({
 }) {
   const { roomId } = use(params);
 
-  // ── Refs ──────────────────────────────────────────────
+  // ── Refs ─────────────────────────────────────────────
   const streamRef = useRef<MediaStream | null>(null);
   const peerRef = useRef<Peer | null>(null);
   const callRef = useRef<MediaConnection | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
+  const roleRef = useRef<"host" | "joiner">("host");
+  const PeerJSRef = useRef<typeof Peer | null>(null);
+  const reconnectCountRef = useRef(0);
 
-  // ── State ─────────────────────────────────────────────
+  // ── State ────────────────────────────────────────────
   const [state, setState] = useState<RoomState>("requesting");
   const [errorMessage, setErrorMessage] = useState("");
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
   const [peerLeft, setPeerLeft] = useState(false);
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
 
-  // ── Callback refs for video elements ──────────────────
+  // ── Callback refs for video elements ─────────────────
   const localVideoRef = useRef<HTMLVideoElement>(null);
   function attachLocalVideo(el: HTMLVideoElement | null) {
     localVideoRef.current = el;
@@ -48,19 +60,28 @@ export default function RoomPage({
     }
   }
 
-  // ── Main effect: camera → PeerJS → connection ────────
+  // ── Main effect ──────────────────────────────────────
   useEffect(() => {
-    if (!navigator.mediaDevices?.getUserMedia) {
+    // Browser support check
+    const { supported, message } = checkBrowserSupport();
+    if (!supported) {
+      setState("error");
+      setErrorMessage(message);
+      return;
+    }
+
+    // Validate room ID
+    if (!isValidRoomId(roomId)) {
       setState("error");
       setErrorMessage(
-        "Your browser doesn't support video calls. Please use Chrome, Firefox, or Safari."
+        "Invalid meeting link. Please check the URL and try again."
       );
       return;
     }
 
     let cancelled = false;
 
-    // Attach call event listeners
+    // ── Call setup helper ──────────────────────────────
     function setupCall(call: MediaConnection) {
       callRef.current = call;
 
@@ -69,6 +90,8 @@ export default function RoomPage({
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = remoteStream;
         }
+        reconnectCountRef.current = 0;
+        setReconnectAttempt(0);
         setState("connected");
         setPeerLeft(false);
       });
@@ -90,29 +113,63 @@ export default function RoomPage({
       });
     }
 
-    // Connect to PeerJS server as the "joiner" (random ID, then call host)
+    // ── Reconnection (only for genuine disconnects) ──
+    function attemptReconnect() {
+      if (cancelled) return;
+      if (reconnectCountRef.current >= MAX_RECONNECT) {
+        setState("error");
+        setErrorMessage(
+          "Connection lost after multiple attempts. Please refresh and try again."
+        );
+        return;
+      }
+
+      reconnectCountRef.current++;
+      setReconnectAttempt(reconnectCountRef.current);
+      setState("reconnecting");
+
+      // Exponential backoff: 1s, 2s, 4s
+      const delay =
+        1000 * Math.pow(2, reconnectCountRef.current - 1);
+      setTimeout(() => {
+        const peer = peerRef.current;
+        if (!cancelled && peer && peer.disconnected && !peer.destroyed) {
+          peer.reconnect();
+        }
+      }, delay);
+    }
+
+    // Attach reconnection ONLY after a peer has successfully opened.
+    // This prevents destroy() during the host→joiner handoff from
+    // triggering the disconnected handler.
+    function attachReconnection(peer: InstanceType<typeof Peer>) {
+      peer.on("disconnected", () => {
+        if (cancelled || peer.destroyed) return;
+        attemptReconnect();
+      });
+    }
+
+    // ── Joiner connection ─────────────────────────────
     function connectAsJoiner(
       PeerJS: typeof Peer,
       stream: MediaStream
     ) {
+      roleRef.current = "joiner";
       const joinerPeer = new PeerJS({
-        host: "0.peerjs.com",
-        port: 443,
-        path: "/",
-        secure: true,
+        ...PEER_CONFIG,
+        config: ICE_SERVERS,
       });
 
       peerRef.current = joinerPeer;
 
       joinerPeer.on("open", () => {
         if (cancelled) return;
+        // Now that we're connected, enable reconnection
+        attachReconnection(joinerPeer);
         const call = joinerPeer.call(roomId, stream);
-        if (call) {
-          setupCall(call);
-        }
+        if (call) setupCall(call);
       });
 
-      // Also answer calls (in case host re-calls us)
       joinerPeer.on("call", (call) => {
         if (cancelled) return;
         call.answer(stream);
@@ -122,19 +179,20 @@ export default function RoomPage({
       joinerPeer.on("error", (err: { type: string }) => {
         if (cancelled) return;
         if (err.type === "peer-unavailable") {
-          // Host not ready yet — likely a race condition, go back to waiting
+          // Host not ready yet — wait, don't treat as fatal
           setState("waiting");
         } else {
           setState("error");
           setErrorMessage(
-            "Connection failed. Please refresh and try again."
+            "Connection failed. Check your internet connection and try again."
           );
         }
       });
     }
 
+    // ── Init ──────────────────────────────────────────
     async function init() {
-      // ── Step 1: Get camera ──
+      // Step 1: Get camera
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -148,15 +206,22 @@ export default function RoomPage({
           switch (err.name) {
             case "NotAllowedError":
               setErrorMessage(
-                "Camera/microphone access denied. Please allow permissions in your browser settings."
+                "Camera access denied. Click the camera icon in your browser's address bar to allow access, then refresh."
               );
               break;
             case "NotFoundError":
-              setErrorMessage("No camera or microphone found.");
+              setErrorMessage(
+                "No camera or microphone detected. Please connect a device and refresh."
+              );
               break;
             case "NotReadableError":
               setErrorMessage(
-                "Camera or microphone is already in use by another application."
+                "Camera or microphone is in use by another application. Close it and refresh."
+              );
+              break;
+            case "OverconstrainedError":
+              setErrorMessage(
+                "Camera doesn't support the requested resolution. Please try a different browser."
               );
               break;
             default:
@@ -178,47 +243,50 @@ export default function RoomPage({
       streamRef.current = stream;
       setState("connecting");
 
-      // ── Step 2: Load PeerJS (dynamic import for SSR safety) ──
+      // Step 2: Load PeerJS
       const { default: PeerJS } = await import("peerjs");
+      PeerJSRef.current = PeerJS;
       if (cancelled) {
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
 
-      // ── Step 3: Try to register as host (peer ID = roomId) ──
+      // Step 3: Try to register as host (peer ID = roomId)
+      roleRef.current = "host";
       const peer = new PeerJS(roomId, {
-        host: "0.peerjs.com",
-        port: 443,
-        path: "/",
-        secure: true,
+        ...PEER_CONFIG,
+        config: ICE_SERVERS,
       });
 
       peerRef.current = peer;
 
       peer.on("open", () => {
         if (cancelled) return;
-        // We're the host — wait for incoming calls
         setState("waiting");
+        // Only NOW attach reconnection — after we know we're the host
+        attachReconnection(peer);
       });
 
-      // Answer any incoming call
       peer.on("call", (call) => {
         if (cancelled) return;
         call.answer(stream);
         setupCall(call);
       });
 
+      // No peer.on("disconnected") here! It's attached inside "open" above.
+      // This prevents destroy() in the unavailable-id handler from
+      // triggering a false reconnection loop.
+
       peer.on("error", (err: { type: string }) => {
         if (cancelled) return;
-
         if (err.type === "unavailable-id") {
-          // Room ID already taken → someone is host → we're the joiner
+          // Expected for 2nd user — destroy this peer and join as caller
           peer.destroy();
           connectAsJoiner(PeerJS, stream);
         } else {
           setState("error");
           setErrorMessage(
-            "Connection failed. Please refresh and try again."
+            "Connection failed. Check your internet connection and try again."
           );
         }
       });
@@ -237,19 +305,19 @@ export default function RoomPage({
     };
   }, [roomId]);
 
-  // ── Controls ──────────────────────────────────────────
+  // ── Controls ─────────────────────────────────────────
   function toggleMute() {
     if (!streamRef.current) return;
-    streamRef.current.getAudioTracks().forEach((track) => {
-      track.enabled = !track.enabled;
+    streamRef.current.getAudioTracks().forEach((t) => {
+      t.enabled = !t.enabled;
     });
     setIsMuted((m) => !m);
   }
 
   function toggleCamera() {
     if (!streamRef.current) return;
-    streamRef.current.getVideoTracks().forEach((track) => {
-      track.enabled = !track.enabled;
+    streamRef.current.getVideoTracks().forEach((t) => {
+      t.enabled = !t.enabled;
     });
     setIsCameraOff((c) => !c);
   }
@@ -264,17 +332,43 @@ export default function RoomPage({
     window.location.href = "/";
   }
 
-  // ── Derived booleans for cleaner JSX ──────────────────
+  // ── Derived ──────────────────────────────────────────
   const showVideo =
     state === "connecting" ||
     state === "waiting" ||
-    state === "connected";
+    state === "connected" ||
+    state === "reconnecting";
+
+  // ── Status text for screen readers ───────────────────
+  const statusText =
+    state === "requesting"
+      ? "Requesting camera access"
+      : state === "connecting"
+        ? "Connecting to server"
+        : state === "waiting"
+          ? peerLeft
+            ? "Participant left the call"
+            : "Waiting for participant"
+          : state === "reconnecting"
+            ? `Reconnecting, attempt ${reconnectAttempt} of ${MAX_RECONNECT}`
+            : state === "connected"
+              ? "Connected"
+              : "";
 
   return (
     <div className="flex h-screen flex-col bg-[#111827]">
+      {/* Screen reader status */}
+      <div aria-live="polite" className="sr-only">
+        {statusText}
+      </div>
+
       {/* ── Top bar ── */}
       <header className="flex shrink-0 items-center justify-between border-b border-white/10 px-4 py-3">
-        <div className="flex items-center gap-2">
+        <a
+          href="/"
+          className="flex items-center gap-2 rounded-lg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-primary"
+          aria-label="Back to home"
+        >
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-primary">
             <svg
               width="16"
@@ -285,19 +379,28 @@ export default function RoomPage({
               strokeWidth="2"
               strokeLinecap="round"
               strokeLinejoin="round"
+              aria-hidden="true"
             >
               <polygon points="23 7 16 12 23 17 23 7" />
               <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
             </svg>
           </div>
           <span className="text-sm font-semibold text-white">MeetUp</span>
-        </div>
+        </a>
 
         <div className="flex items-center gap-3">
           {state === "connected" && (
             <div className="flex items-center gap-1.5 rounded-md bg-green-500/20 px-2.5 py-1">
               <div className="h-2 w-2 rounded-full bg-green-400" />
               <span className="text-xs text-green-300">Connected</span>
+            </div>
+          )}
+          {state === "reconnecting" && (
+            <div className="flex items-center gap-1.5 rounded-md bg-yellow-500/20 px-2.5 py-1">
+              <div className="h-2 w-2 animate-pulse rounded-full bg-yellow-400" />
+              <span className="text-xs text-yellow-300">
+                Reconnecting ({reconnectAttempt}/{MAX_RECONNECT})
+              </span>
             </div>
           )}
           <div className="rounded-md bg-white/10 px-3 py-1 text-xs text-slate-300">
@@ -307,8 +410,8 @@ export default function RoomPage({
       </header>
 
       {/* ── Main content ── */}
-      <main className="relative flex min-h-0 flex-1 items-center justify-center p-4">
-        {/* Requesting camera access */}
+      <main className="relative flex min-h-0 flex-1 items-center justify-center p-2 sm:p-4">
+        {/* Requesting */}
         {state === "requesting" && (
           <div className="flex flex-col items-center gap-4">
             <div className="h-10 w-10 animate-spin rounded-full border-4 border-white/20 border-t-blue-primary" />
@@ -318,7 +421,7 @@ export default function RoomPage({
           </div>
         )}
 
-        {/* Error state */}
+        {/* Error */}
         {state === "error" && (
           <div className="flex max-w-md flex-col items-center gap-4 rounded-xl border border-red-500/30 bg-red-500/10 p-6 text-center">
             <div className="flex h-12 w-12 items-center justify-center rounded-full bg-red-500/20">
@@ -331,16 +434,19 @@ export default function RoomPage({
                 strokeWidth="2"
                 strokeLinecap="round"
                 strokeLinejoin="round"
+                aria-hidden="true"
               >
                 <circle cx="12" cy="12" r="10" />
                 <line x1="12" y1="8" x2="12" y2="12" />
                 <line x1="12" y1="16" x2="12.01" y2="16" />
               </svg>
             </div>
-            <p className="text-sm text-red-300">{errorMessage}</p>
+            <p role="alert" className="text-sm text-red-300">
+              {errorMessage}
+            </p>
             <button
               onClick={() => window.location.reload()}
-              className="cursor-pointer rounded-lg bg-white/10 px-4 py-2 text-sm text-white transition-colors hover:bg-white/20"
+              className="cursor-pointer rounded-lg bg-white/10 px-4 py-2 text-sm text-white transition-colors hover:bg-white/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
             >
               Try Again
             </button>
@@ -350,7 +456,7 @@ export default function RoomPage({
         {/* Video area */}
         {showVideo && (
           <div className="relative flex h-full w-full max-w-5xl items-center justify-center">
-            {/* Remote video — fills main area when connected */}
+            {/* Remote video */}
             {state === "connected" && (
               <div className="relative h-full w-full overflow-hidden rounded-2xl bg-black">
                 <video
@@ -365,11 +471,11 @@ export default function RoomPage({
               </div>
             )}
 
-            {/* Local video — large when alone, PiP corner when connected */}
+            {/* Local video — large when alone, PiP when connected */}
             <div
               className={
                 state === "connected"
-                  ? "absolute bottom-4 right-4 z-10 aspect-video w-48 overflow-hidden rounded-xl border-2 border-white/20 bg-black shadow-lg"
+                  ? "absolute bottom-3 right-3 z-10 aspect-video w-36 overflow-hidden rounded-xl border-2 border-white/20 bg-black shadow-lg transition-all sm:bottom-4 sm:right-4 sm:w-48"
                   : "relative aspect-video w-full max-w-3xl overflow-hidden rounded-2xl bg-black"
               }
             >
@@ -391,6 +497,7 @@ export default function RoomPage({
                     strokeWidth="2"
                     strokeLinecap="round"
                     strokeLinejoin="round"
+                    aria-hidden="true"
                   >
                     <line x1="1" y1="1" x2="23" y2="23" />
                     <path d="M21 21H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3m3-3h6l2 3h4a2 2 0 0 1 2 2v9.34m-7.72-2.06a4 4 0 1 1-5.56-5.56" />
@@ -404,7 +511,7 @@ export default function RoomPage({
 
             {/* Status overlays */}
             {state === "connecting" && (
-              <div className="absolute left-1/2 top-6 -translate-x-1/2 flex items-center gap-2 rounded-lg bg-black/70 px-4 py-2">
+              <div className="absolute left-1/2 top-6 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-black/70 px-4 py-2">
                 <div className="h-3 w-3 animate-spin rounded-full border-2 border-white/20 border-t-white" />
                 <p className="text-sm text-slate-300">
                   Connecting to server...
@@ -412,13 +519,23 @@ export default function RoomPage({
               </div>
             )}
 
-            {(state === "waiting" || (state === "connecting" && !peerLeft)) && state === "waiting" && (
-              <div className="absolute left-1/2 top-6 -translate-x-1/2 flex items-center gap-2 rounded-lg bg-black/70 px-4 py-2">
+            {state === "waiting" && (
+              <div className="absolute left-1/2 top-6 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-black/70 px-4 py-2">
                 <div className="h-2 w-2 animate-pulse rounded-full bg-yellow-400" />
                 <p className="text-sm text-slate-300">
                   {peerLeft
                     ? "Participant left the call"
                     : "Waiting for participant..."}
+                </p>
+              </div>
+            )}
+
+            {state === "reconnecting" && (
+              <div className="absolute left-1/2 top-6 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg bg-yellow-900/80 px-4 py-2">
+                <div className="h-3 w-3 animate-spin rounded-full border-2 border-yellow-200/30 border-t-yellow-200" />
+                <p className="text-sm text-yellow-200">
+                  Connection lost. Trying again ({reconnectAttempt}/
+                  {MAX_RECONNECT})...
                 </p>
               </div>
             )}
@@ -428,17 +545,17 @@ export default function RoomPage({
 
       {/* ── Bottom control bar ── */}
       {showVideo && (
-        <footer className="flex shrink-0 items-center justify-center border-t border-white/10 px-4 py-4">
+        <footer className="flex shrink-0 items-center justify-center border-t border-white/10 px-4 py-3 sm:py-4">
           <div className="flex items-center gap-3">
             {/* Mute / Unmute */}
             <button
               onClick={toggleMute}
-              className={`flex h-12 w-12 cursor-pointer items-center justify-center rounded-full transition-colors ${
+              aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
+              className={`flex h-11 w-11 cursor-pointer items-center justify-center rounded-full transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white sm:h-12 sm:w-12 ${
                 isMuted
                   ? "bg-red-500/20 hover:bg-red-500/30"
                   : "bg-white/10 hover:bg-white/20"
               }`}
-              title={isMuted ? "Unmute" : "Mute"}
             >
               {isMuted ? (
                 <svg
@@ -450,6 +567,7 @@ export default function RoomPage({
                   strokeWidth="2"
                   strokeLinecap="round"
                   strokeLinejoin="round"
+                  aria-hidden="true"
                 >
                   <line x1="1" y1="1" x2="23" y2="23" />
                   <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
@@ -467,6 +585,7 @@ export default function RoomPage({
                   strokeWidth="2"
                   strokeLinecap="round"
                   strokeLinejoin="round"
+                  aria-hidden="true"
                 >
                   <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
                   <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
@@ -479,12 +598,12 @@ export default function RoomPage({
             {/* Camera On / Off */}
             <button
               onClick={toggleCamera}
-              className={`flex h-12 w-12 cursor-pointer items-center justify-center rounded-full transition-colors ${
+              aria-label={isCameraOff ? "Turn camera on" : "Turn camera off"}
+              className={`flex h-11 w-11 cursor-pointer items-center justify-center rounded-full transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white sm:h-12 sm:w-12 ${
                 isCameraOff
                   ? "bg-red-500/20 hover:bg-red-500/30"
                   : "bg-white/10 hover:bg-white/20"
               }`}
-              title={isCameraOff ? "Turn camera on" : "Turn camera off"}
             >
               {isCameraOff ? (
                 <svg
@@ -496,6 +615,7 @@ export default function RoomPage({
                   strokeWidth="2"
                   strokeLinecap="round"
                   strokeLinejoin="round"
+                  aria-hidden="true"
                 >
                   <line x1="1" y1="1" x2="23" y2="23" />
                   <path d="M21 21H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3m3-3h6l2 3h4a2 2 0 0 1 2 2v9.34m-7.72-2.06a4 4 0 1 1-5.56-5.56" />
@@ -510,6 +630,7 @@ export default function RoomPage({
                   strokeWidth="2"
                   strokeLinecap="round"
                   strokeLinejoin="round"
+                  aria-hidden="true"
                 >
                   <polygon points="23 7 16 12 23 17 23 7" />
                   <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
@@ -520,8 +641,8 @@ export default function RoomPage({
             {/* Leave call */}
             <button
               onClick={leaveCall}
-              className="flex h-12 w-12 cursor-pointer items-center justify-center rounded-full bg-red-600 transition-colors hover:bg-red-700"
-              title="Leave call"
+              aria-label="Leave call"
+              className="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-red-600 transition-colors hover:bg-red-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white sm:h-12 sm:w-12"
             >
               <svg
                 width="20"
@@ -532,6 +653,7 @@ export default function RoomPage({
                 strokeWidth="2"
                 strokeLinecap="round"
                 strokeLinejoin="round"
+                aria-hidden="true"
               >
                 <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91" />
                 <line x1="23" y1="1" x2="1" y2="23" />
