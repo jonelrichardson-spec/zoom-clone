@@ -5,6 +5,7 @@ import type Peer from "peerjs";
 import type { MediaConnection } from "peerjs";
 import { PEER_CONFIG, ICE_SERVERS } from "@/lib/peerConfig";
 import { checkBrowserSupport, isValidRoomId } from "@/lib/browserCheck";
+import { Camera, Mic, MicOff, CameraOff, Play, Settings2 } from "lucide-react";
 
 // ── Types ──────────────────────────────────────────────
 type RoomState =
@@ -14,6 +15,11 @@ type RoomState =
   | "connected"
   | "reconnecting"
   | "error";
+
+type DeviceInfo = {
+  deviceId: string;
+  label: string;
+};
 
 const MAX_RECONNECT = 3;
 const RECONNECT_DELAY = 2000;
@@ -35,6 +41,19 @@ export default function RoomPage({
   const PeerJSRef = useRef<typeof Peer | null>(null);
   const reconnectCountRef = useRef(0);
 
+  // ── Preview State ────────────────────────────────────
+  const [isPreviewing, setIsPreviewing] = useState(true);
+  const [previewCameras, setPreviewCameras] = useState<DeviceInfo[]>([]);
+  const [previewMicrophones, setPreviewMicrophones] = useState<DeviceInfo[]>(
+    []
+  );
+  const [selectedCamera, setSelectedCamera] = useState<string>("");
+  const [selectedMicrophone, setSelectedMicrophone] = useState<string>("");
+  const [previewIsMuted, setPreviewIsMuted] = useState(false);
+  const [previewIsCameraOff, setPreviewIsCameraOff] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(true);
+  const [previewError, setPreviewError] = useState<string>("");
+
   // ── State ────────────────────────────────────────────
   const [state, setState] = useState<RoomState>("requesting");
   const [errorMessage, setErrorMessage] = useState("");
@@ -45,8 +64,17 @@ export default function RoomPage({
 
   // ── Callback refs for video elements ─────────────────
   const localVideoRef = useRef<HTMLVideoElement>(null);
+  const previewVideoRef = useRef<HTMLVideoElement>(null);
+
   function attachLocalVideo(el: HTMLVideoElement | null) {
     localVideoRef.current = el;
+    if (el && streamRef.current) {
+      el.srcObject = streamRef.current;
+    }
+  }
+
+  function attachPreviewVideo(el: HTMLVideoElement | null) {
+    previewVideoRef.current = el;
     if (el && streamRef.current) {
       el.srcObject = streamRef.current;
     }
@@ -60,8 +88,128 @@ export default function RoomPage({
     }
   }
 
+  // ── Preview: Enumerate Devices ──────────────────────
+  useEffect(() => {
+    async function enumerateDevices() {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cameras = devices
+          .filter((d) => d.kind === "videoinput")
+          .map((d) => ({ deviceId: d.deviceId, label: d.label || `Camera ${d.deviceId.slice(0, 5)}` }));
+        const mics = devices
+          .filter((d) => d.kind === "audioinput")
+          .map((d) => ({ deviceId: d.deviceId, label: d.label || `Microphone ${d.deviceId.slice(0, 5)}` }));
+
+        setPreviewCameras(cameras);
+        setPreviewMicrophones(mics);
+        setSelectedCamera(cameras[0]?.deviceId || "");
+        setSelectedMicrophone(mics[0]?.deviceId || "");
+      } catch {
+        setPreviewError("Unable to enumerate devices");
+      }
+    }
+
+    enumerateDevices();
+  }, []);
+
+  // ── Preview: Request Camera Stream ──────────────────
+  useEffect(() => {
+    if (!isPreviewing) return;
+
+    setPreviewLoading(true);
+    setPreviewError("");
+
+    const requestPreviewStream = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: selectedCamera ? { deviceId: { exact: selectedCamera } } : true,
+          audio: selectedMicrophone ? { deviceId: { exact: selectedMicrophone } } : true,
+        });
+
+        streamRef.current = stream;
+        setPreviewLoading(false);
+
+        // Apply initial mute/camera states
+        stream.getAudioTracks().forEach((track) => {
+          track.enabled = !previewIsMuted;
+        });
+        stream.getVideoTracks().forEach((track) => {
+          track.enabled = !previewIsCameraOff;
+        });
+      } catch (err) {
+        setPreviewLoading(false);
+        if (err instanceof DOMException) {
+          if (err.name === "NotAllowedError") {
+            setPreviewError(
+              "Camera access denied. Enable it in your browser settings."
+            );
+          } else if (err.name === "NotFoundError") {
+            setPreviewError("No camera or microphone found.");
+          } else if (err.name === "NotReadableError") {
+            setPreviewError(
+              "Camera is in use by another app. Close it and try again."
+            );
+          } else {
+            setPreviewError(err.message);
+          }
+        } else {
+          setPreviewError("Failed to access camera.");
+        }
+      }
+    };
+
+    requestPreviewStream();
+
+    return () => {
+      // Don't stop stream here; we need it for the call
+    };
+  }, [isPreviewing, selectedCamera, selectedMicrophone]);
+
+  // ── Preview: Switch Camera ──────────────────────────
+  const switchCamera = async (deviceId: string) => {
+    setSelectedCamera(deviceId);
+    if (streamRef.current) {
+      streamRef.current.getVideoTracks().forEach((track) => track.stop());
+    }
+  };
+
+  // ── Preview: Switch Microphone ──────────────────────
+  const switchMicrophone = async (deviceId: string) => {
+    setSelectedMicrophone(deviceId);
+    if (streamRef.current) {
+      streamRef.current.getAudioTracks().forEach((track) => track.stop());
+    }
+  };
+
+  // ── Preview: Toggle Mute ────────────────────────────
+  const togglePreviewMute = () => {
+    if (!streamRef.current) return;
+    streamRef.current.getAudioTracks().forEach((track) => {
+      track.enabled = previewIsMuted;
+    });
+    setPreviewIsMuted(!previewIsMuted);
+  };
+
+  // ── Preview: Toggle Camera ──────────────────────────
+  const togglePreviewCamera = () => {
+    if (!streamRef.current) return;
+    streamRef.current.getVideoTracks().forEach((track) => {
+      track.enabled = previewIsCameraOff;
+    });
+    setPreviewIsCameraOff(!previewIsCameraOff);
+  };
+
+  // ── Preview: Join Meeting ──────────────────────────
+  const handleJoinMeeting = async () => {
+    // Stream is ready, transition to call
+    setIsPreviewing(false);
+    setState("connecting");
+  };
+
   // ── Main effect ──────────────────────────────────────
   useEffect(() => {
+    if (isPreviewing) return; // Don't start call setup while previewing
+
     // Browser support check
     const { supported, message } = checkBrowserSupport();
     if (!supported) {
@@ -98,156 +246,129 @@ export default function RoomPage({
 
       call.on("close", () => {
         remoteStreamRef.current = null;
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = null;
-        }
-        callRef.current = null;
         setState("waiting");
         setPeerLeft(true);
       });
 
-      call.on("error", () => {
-        remoteStreamRef.current = null;
-        callRef.current = null;
-        setState("waiting");
-      });
-    }
-
-    // ── Reconnection (only for genuine disconnects) ──
-    function attemptReconnect() {
-      if (cancelled) return;
-      if (reconnectCountRef.current >= MAX_RECONNECT) {
+      call.on("error", (err) => {
         setState("error");
-        setErrorMessage(
-          "Connection lost after multiple attempts. Please refresh and try again."
-        );
-        return;
-      }
-
-      reconnectCountRef.current++;
-      setReconnectAttempt(reconnectCountRef.current);
-      setState("reconnecting");
-
-      // Exponential backoff: 1s, 2s, 4s
-      const delay =
-        1000 * Math.pow(2, reconnectCountRef.current - 1);
-      setTimeout(() => {
-        const peer = peerRef.current;
-        if (!cancelled && peer && peer.disconnected && !peer.destroyed) {
-          peer.reconnect();
-        }
-      }, delay);
-    }
-
-    // Attach reconnection ONLY after a peer has successfully opened.
-    // This prevents destroy() during the host→joiner handoff from
-    // triggering the disconnected handler.
-    function attachReconnection(peer: InstanceType<typeof Peer>) {
-      peer.on("disconnected", () => {
-        if (cancelled || peer.destroyed) return;
-        attemptReconnect();
+        setErrorMessage(`Call error: ${err.message}`);
       });
     }
 
-    // ── Joiner connection ─────────────────────────────
-    function connectAsJoiner(
-      PeerJS: typeof Peer,
-      stream: MediaStream
-    ) {
+    // ── Reconnection logic ──────────────────────────────
+    function attachReconnection(peer: Peer) {
+      peer.on("disconnected", () => {
+        if (cancelled) return;
+        if (reconnectCountRef.current >= MAX_RECONNECT) {
+          setState("error");
+          setErrorMessage("Connection lost. Please refresh and try again.");
+          return;
+        }
+
+        setState("reconnecting");
+        setReconnectAttempt((prev) => prev + 1);
+        reconnectCountRef.current += 1;
+
+        setTimeout(() => {
+          if (cancelled) return;
+          peer.reconnect();
+        }, RECONNECT_DELAY);
+      });
+    }
+
+    // ── Join as joiner ──────────────────────────────────
+    function connectAsJoiner(PeerJS: typeof Peer, stream: MediaStream) {
+      if (cancelled) return;
+
       roleRef.current = "joiner";
-      const joinerPeer = new PeerJS({
+      const peer = new PeerJS({
         ...PEER_CONFIG,
         config: ICE_SERVERS,
       });
 
-      peerRef.current = joinerPeer;
+      peerRef.current = peer;
 
-      joinerPeer.on("open", () => {
+      peer.on("open", () => {
         if (cancelled) return;
-        // Now that we're connected, enable reconnection
-        attachReconnection(joinerPeer);
-        const call = joinerPeer.call(roomId, stream);
-        if (call) setupCall(call);
-      });
 
-      joinerPeer.on("call", (call) => {
-        if (cancelled) return;
-        call.answer(stream);
+        const call = peer.call(roomId, stream);
         setupCall(call);
+
+        attachReconnection(peer);
       });
 
-      joinerPeer.on("error", (err: { type: string }) => {
+      peer.on("error", (err: { type: string }) => {
         if (cancelled) return;
-        if (err.type === "peer-unavailable") {
-          // Host not ready yet — wait, don't treat as fatal
-          setState("waiting");
-        } else {
-          setState("error");
-          setErrorMessage(
-            "Connection failed. Check your internet connection and try again."
-          );
-        }
+        setState("error");
+        setErrorMessage(
+          "Connection failed. Check your internet connection and try again."
+        );
       });
     }
 
-    // ── Init ──────────────────────────────────────────
+    // ── Main init ──────────────────────────────────────
     async function init() {
-      // Step 1: Get camera
-      let stream: MediaStream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: { echoCancellation: true, noiseSuppression: true },
-        });
-      } catch (err) {
-        if (cancelled) return;
-        setState("error");
-        if (err instanceof DOMException) {
-          switch (err.name) {
-            case "NotAllowedError":
-              setErrorMessage(
-                "Camera access denied. Click the camera icon in your browser's address bar to allow access, then refresh."
-              );
-              break;
-            case "NotFoundError":
-              setErrorMessage(
-                "No camera or microphone detected. Please connect a device and refresh."
-              );
-              break;
-            case "NotReadableError":
-              setErrorMessage(
-                "Camera or microphone is in use by another application. Close it and refresh."
-              );
-              break;
-            case "OverconstrainedError":
-              setErrorMessage(
-                "Camera doesn't support the requested resolution. Please try a different browser."
-              );
-              break;
-            default:
-              setErrorMessage(err.message);
+      // Stream already exists from preview, just use it
+      if (!streamRef.current) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+          });
+          streamRef.current = stream;
+        } catch (err) {
+          if (cancelled) return;
+          setState("error");
+          if (err instanceof DOMException) {
+            switch (err.name) {
+              case "NotAllowedError":
+                setErrorMessage(
+                  "Camera access denied. Click the camera icon in your browser's address bar to allow access, then refresh."
+                );
+                break;
+              case "NotFoundError":
+                setErrorMessage(
+                  "No camera or microphone detected. Please connect a device and refresh."
+                );
+                break;
+              case "NotReadableError":
+                setErrorMessage(
+                  "Camera or microphone is in use by another application. Close it and refresh."
+                );
+                break;
+              case "OverconstrainedError":
+                setErrorMessage(
+                  "Camera doesn't support the requested resolution. Please try a different browser."
+                );
+                break;
+              default:
+                setErrorMessage(err.message);
+            }
+          } else {
+            setErrorMessage(
+              "An unexpected error occurred accessing your camera."
+            );
           }
-        } else {
-          setErrorMessage(
-            "An unexpected error occurred accessing your camera."
-          );
+          return;
         }
-        return;
       }
 
       if (cancelled) {
-        stream.getTracks().forEach((t) => t.stop());
+        streamRef.current?.getTracks().forEach((t) => t.stop());
         return;
       }
 
-      streamRef.current = stream;
       setState("connecting");
 
       // Step 2: Load PeerJS
       const { default: PeerJS } = await import("peerjs");
       PeerJSRef.current = PeerJS;
       if (cancelled) {
-        stream.getTracks().forEach((t) => t.stop());
+        streamRef.current?.getTracks().forEach((t) => t.stop());
         return;
       }
 
@@ -269,7 +390,7 @@ export default function RoomPage({
 
       peer.on("call", (call) => {
         if (cancelled) return;
-        call.answer(stream);
+        call.answer(streamRef.current!);
         setupCall(call);
       });
 
@@ -282,7 +403,7 @@ export default function RoomPage({
         if (err.type === "unavailable-id") {
           // Expected for 2nd user — destroy this peer and join as caller
           peer.destroy();
-          connectAsJoiner(PeerJS, stream);
+          connectAsJoiner(PeerJS, streamRef.current!);
         } else {
           setState("error");
           setErrorMessage(
@@ -303,7 +424,7 @@ export default function RoomPage({
         streamRef.current = null;
       }
     };
-  }, [roomId]);
+  }, [roomId, isPreviewing]);
 
   // ── Controls ─────────────────────────────────────────
   function toggleMute() {
@@ -349,122 +470,205 @@ export default function RoomPage({
           ? peerLeft
             ? "Participant left the call"
             : "Waiting for participant"
-          : state === "reconnecting"
-            ? `Reconnecting, attempt ${reconnectAttempt} of ${MAX_RECONNECT}`
-            : state === "connected"
-              ? "Connected"
-              : "";
+          : state === "connected"
+            ? "Call connected"
+            : state === "reconnecting"
+              ? "Reconnecting"
+              : "Error";
 
-  return (
-    <div className="flex h-screen flex-col bg-[#111827]">
-      {/* Screen reader status */}
-      <div aria-live="polite" className="sr-only">
-        {statusText}
-      </div>
+  // ── PREVIEW SCREEN ──────────────────────────────────
+  if (isPreviewing) {
+    return (
+      <div className="flex h-screen flex-col bg-slate-900 text-white">
+        {/* Header */}
+        <header className="border-b border-white/10 px-6 py-4">
+          <h1 className="text-2xl font-bold">Join Meeting</h1>
+          <p className="mt-1 text-sm text-slate-400">Room: {roomId}</p>
+        </header>
 
-      {/* ── Top bar ── */}
-      <header className="flex shrink-0 items-center justify-between border-b border-white/10 px-4 py-3">
-        <a
-          href="/"
-          className="flex items-center gap-2 rounded-lg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-primary"
-          aria-label="Back to home"
-        >
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-primary">
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="white"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
+        {/* Main Content */}
+        <main className="flex flex-1 flex-col items-center justify-center gap-6 px-4 py-8 sm:flex-row sm:gap-12">
+          {/* Video Preview */}
+          <div className="flex w-full flex-col items-center gap-4 sm:w-auto">
+            <div className="relative aspect-video w-full max-w-xl overflow-hidden rounded-2xl bg-slate-800 shadow-2xl">
+              {previewLoading && (
+                <div className="absolute inset-0 flex items-center justify-center bg-slate-800">
+                  <div className="h-8 w-8 animate-spin rounded-full border-4 border-white/20 border-t-blue-500" />
+                </div>
+              )}
+              {!previewLoading && previewError && (
+                <div className="absolute inset-0 flex items-center justify-center bg-slate-800">
+                  <div className="text-center">
+                    <CameraOff className="mx-auto mb-2 h-12 w-12 text-red-400" />
+                    <p className="text-sm text-red-300">{previewError}</p>
+                  </div>
+                </div>
+              )}
+              {!previewError && (
+                <video
+                  ref={attachPreviewVideo}
+                  autoPlay
+                  playsInline
+                  muted
+                  className={`h-full w-full object-cover ${
+                    previewLoading ? "hidden" : ""
+                  }`}
+                />
+              )}
+              {previewIsCameraOff && !previewError && (
+                <div className="absolute inset-0 flex items-center justify-center bg-slate-800">
+                  <CameraOff className="h-16 w-16 text-slate-500" />
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Settings Panel */}
+          <div className="flex w-full flex-col gap-6 sm:w-96">
+            {/* Camera Selection */}
+            <div>
+              <label className="mb-2 flex items-center gap-2 text-sm font-semibold">
+                <Camera className="h-4 w-4" />
+                Camera
+              </label>
+              <select
+                value={selectedCamera}
+                onChange={(e) => switchCamera(e.target.value)}
+                className="w-full rounded-lg border border-white/20 bg-slate-800 px-3 py-2 text-white placeholder-slate-400 focus:border-blue-500 focus:outline-none"
+              >
+                {previewCameras.map((cam) => (
+                  <option key={cam.deviceId} value={cam.deviceId}>
+                    {cam.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Microphone Selection */}
+            <div>
+              <label className="mb-2 flex items-center gap-2 text-sm font-semibold">
+                <Mic className="h-4 w-4" />
+                Microphone
+              </label>
+              <select
+                value={selectedMicrophone}
+                onChange={(e) => switchMicrophone(e.target.value)}
+                className="w-full rounded-lg border border-white/20 bg-slate-800 px-3 py-2 text-white placeholder-slate-400 focus:border-blue-500 focus:outline-none"
+              >
+                {previewMicrophones.map((mic) => (
+                  <option key={mic.deviceId} value={mic.deviceId}>
+                    {mic.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Test Controls */}
+            <div className="grid grid-cols-2 gap-3 rounded-lg border border-white/10 bg-slate-800/50 p-4">
+              <button
+                onClick={togglePreviewMute}
+                className={`flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
+                  previewIsMuted
+                    ? "bg-red-500/20 text-red-300 hover:bg-red-500/30"
+                    : "bg-white/10 text-white hover:bg-white/20"
+                }`}
+              >
+                {previewIsMuted ? (
+                  <MicOff className="h-4 w-4" />
+                ) : (
+                  <Mic className="h-4 w-4" />
+                )}
+                {previewIsMuted ? "Unmute" : "Mute"}
+              </button>
+              <button
+                onClick={togglePreviewCamera}
+                className={`flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
+                  previewIsCameraOff
+                    ? "bg-red-500/20 text-red-300 hover:bg-red-500/30"
+                    : "bg-white/10 text-white hover:bg-white/20"
+                }`}
+              >
+                {previewIsCameraOff ? (
+                  <CameraOff className="h-4 w-4" />
+                ) : (
+                  <Camera className="h-4 w-4" />
+                )}
+                {previewIsCameraOff ? "Camera Off" : "Camera On"}
+              </button>
+            </div>
+
+            {/* Join Button */}
+            <button
+              onClick={handleJoinMeeting}
+              disabled={previewLoading || !!previewError}
+              className="flex items-center justify-center gap-2 rounded-lg bg-blue-600 px-6 py-3 font-semibold text-white transition-colors hover:bg-blue-700 disabled:bg-slate-600 disabled:text-slate-400"
             >
-              <polygon points="23 7 16 12 23 17 23 7" />
-              <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-            </svg>
+              <Play className="h-5 w-5" />
+              Join Meeting
+            </button>
           </div>
-          <span className="text-sm font-semibold text-white">MeetUp</span>
-        </a>
+        </main>
+      </div>
+    );
+  }
 
-        <div className="flex items-center gap-3">
-          {state === "connected" && (
-            <div className="flex items-center gap-1.5 rounded-md bg-green-500/20 px-2.5 py-1">
-              <div className="h-2 w-2 rounded-full bg-green-400" />
-              <span className="text-xs text-green-300">Connected</span>
-            </div>
-          )}
-          {state === "reconnecting" && (
-            <div className="flex items-center gap-1.5 rounded-md bg-yellow-500/20 px-2.5 py-1">
-              <div className="h-2 w-2 animate-pulse rounded-full bg-yellow-400" />
-              <span className="text-xs text-yellow-300">
-                Reconnecting ({reconnectAttempt}/{MAX_RECONNECT})
-              </span>
-            </div>
-          )}
-          <div className="rounded-md bg-white/10 px-3 py-1 text-xs text-slate-300">
-            Room: {roomId}
+  // ── CALL SCREEN ──────────────────────────────────────
+  return (
+    <div className="flex h-screen flex-col bg-black text-white">
+      {/* ── Status bar ── */}
+      <header className="border-b border-white/10 px-4 py-3 sm:px-6 sm:py-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="font-semibold">Meeting {roomId}</h1>
+            <p className="text-xs text-slate-400 sm:text-sm">
+              {state === "waiting" && (peerLeft ? "Participant left" : "Waiting for participant...")}
+              {state === "connected" && "Connected"}
+              {state === "connecting" && "Connecting..."}
+              {state === "reconnecting" && `Reconnecting (${reconnectAttempt}/${MAX_RECONNECT})`}
+            </p>
           </div>
+          <span className="text-xs font-medium text-slate-400">
+            {statusText}
+          </span>
         </div>
       </header>
 
-      {/* ── Main content ── */}
-      <main className="relative flex min-h-0 flex-1 items-center justify-center p-2 sm:p-4">
-        {/* Requesting */}
-        {state === "requesting" && (
-          <div className="flex flex-col items-center gap-4">
-            <div className="h-10 w-10 animate-spin rounded-full border-4 border-white/20 border-t-blue-primary" />
-            <p className="text-sm text-slate-300">
-              Requesting camera access...
-            </p>
-          </div>
-        )}
-
-        {/* Error */}
-        {state === "error" && (
-          <div className="flex max-w-md flex-col items-center gap-4 rounded-xl border border-red-500/30 bg-red-500/10 p-6 text-center">
-            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-red-500/20">
-              <svg
-                width="24"
-                height="24"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="#ef4444"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="10" />
-                <line x1="12" y1="8" x2="12" y2="12" />
-                <line x1="12" y1="16" x2="12.01" y2="16" />
-              </svg>
-            </div>
-            <p role="alert" className="text-sm text-red-300">
-              {errorMessage}
-            </p>
+      {/* ── Main video area ── */}
+      {state === "error" ? (
+        <main className="flex flex-1 items-center justify-center px-4">
+          <div className="max-w-md rounded-lg border border-red-500/50 bg-red-500/10 p-6 text-center">
+            <h2 className="mb-2 text-lg font-semibold text-red-400">
+              Connection Error
+            </h2>
+            <p className="mb-4 text-sm text-red-300">{errorMessage}</p>
             <button
-              onClick={() => window.location.reload()}
-              className="cursor-pointer rounded-lg bg-white/10 px-4 py-2 text-sm text-white transition-colors hover:bg-white/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+              onClick={() => (window.location.href = "/")}
+              className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium transition-colors hover:bg-red-700"
             >
-              Try Again
+              Go Back Home
             </button>
           </div>
-        )}
-
-        {/* Video area */}
-        {showVideo && (
-          <div className="relative flex h-full w-full max-w-5xl items-center justify-center">
-            {/* Remote video */}
-            {state === "connected" && (
-              <div className="relative h-full w-full overflow-hidden rounded-2xl bg-black">
+        </main>
+      ) : (
+        <main className="flex flex-1 flex-col items-center justify-center overflow-hidden px-2 py-4 sm:px-4 sm:py-6">
+          <div className="flex h-full w-full max-w-5xl flex-col items-center justify-center gap-4">
+            {/* Remote video — full size when available */}
+            {remoteStreamRef.current && state === "connected" && (
+              <div className="relative w-full flex-1 overflow-hidden rounded-2xl bg-black">
                 <video
                   ref={attachRemoteVideo}
                   autoPlay
                   playsInline
                   className="h-full w-full object-cover"
                 />
+                {state !== "connected" && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+                    <div className="text-center">
+                      <div className="mb-2 h-8 w-8 animate-spin rounded-full border-4 border-white/20 border-t-white" />
+                      <p className="text-sm text-slate-300">Loading video...</p>
+                    </div>
+                  </div>
+                )}
                 <div className="absolute bottom-3 left-3 rounded-md bg-black/60 px-2 py-1 text-xs text-white">
                   Remote
                 </div>
@@ -540,8 +744,8 @@ export default function RoomPage({
               </div>
             )}
           </div>
-        )}
-      </main>
+        </main>
+      )}
 
       {/* ── Bottom control bar ── */}
       {showVideo && (
